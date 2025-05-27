@@ -34,4 +34,5 @@ typedef struct http_info {
     unsigned char jsonrpc_id[JSONRPC_ID_SIZE];
     u32 jsonrpc_params_len;
     u8 is_jsonrpc;
+    u8 _pad2[3];
 } http_info_t;
