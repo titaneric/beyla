@@ -26,6 +26,7 @@
 #include <gotracer/go_str.h>
 #include <gotracer/go_stream_key.h>
 #include <gotracer/hpack.h>
+#include <gotracer/protocol_jsonrpc.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -67,6 +68,8 @@ typedef struct server_http_func_invocation {
     u8 method[METHOD_MAX_LEN];
     u8 path[PATH_MAX_LEN];
     u8 _pad[5];
+    u64 body_addr; // pointer to the body buffer
+    u8 content_type[HTTP_CONTENT_TYPE_MAX_LEN];
 } server_http_func_invocation_t;
 
 struct {
@@ -93,12 +96,12 @@ int beyla_uprobe_ServeHTTP(struct pt_regs *ctx) {
 
     off_table_t *ot = get_offsets_table();
 
-    // Lookup any traceparent information setup for us by readContinuedLineSlice
-    server_http_func_invocation_t *tp_inv =
+    // Lookup any header information setup for us by readContinuedLineSlice
+    server_http_func_invocation_t *header_inv =
         bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
     tp_info_t *decoded_tp = 0;
-    if (tp_inv && valid_trace(tp_inv->tp.trace_id)) {
-        decoded_tp = &tp_inv->tp;
+    if (header_inv && valid_trace(header_inv->tp.trace_id)) {
+        decoded_tp = &header_inv->tp;
     }
 
     server_http_func_invocation_t invocation = {
@@ -116,6 +119,14 @@ int beyla_uprobe_ServeHTTP(struct pt_regs *ctx) {
         server_trace_parent(goroutine_addr, &invocation.tp, decoded_tp);
         // TODO: if context propagation is supported, overwrite the header value in the map with the
         // new span context and the same thread id.
+
+        // get content-type from readContinuedLineSlice
+        if (header_inv && header_inv->content_type[0]) {
+            bpf_dbg_printk("Found content type in ongoing request: %s", header_inv->content_type);
+            __builtin_memcpy(invocation.content_type,
+                             header_inv->content_type,
+                             sizeof(header_inv->content_type));
+        }
 
         // Get method from Request.Method
         if (!read_go_str("method",
@@ -262,6 +273,19 @@ int beyla_uprobe_http2Server_processHeaders(struct pt_regs *ctx) {
     return 0;
 }
 
+static __always_inline void update_traceparent(server_http_func_invocation_t *inv,
+                                               u8 *header_start) {
+    decode_go_traceparent(header_start, inv->tp.trace_id, inv->tp.parent_id, &inv->tp.flags);
+    bpf_dbg_printk("Found traceparent in header %s", header_start);
+}
+
+static __always_inline void update_content_type(server_http_func_invocation_t *inv,
+                                                u8 *header_start) {
+    __builtin_memset(inv->content_type, 0, sizeof(inv->content_type));
+    __builtin_memcpy(inv->content_type, header_start, sizeof(inv->content_type));
+    bpf_dbg_printk("Found content-type in header %s", inv->content_type);
+}
+
 SEC("uprobe/readContinuedLineSlice")
 int beyla_uprobe_readContinuedLineSliceReturns(struct pt_regs *ctx) {
     bpf_dbg_printk("=== uprobe/proc readContinuedLineSlice returns === ");
@@ -270,22 +294,45 @@ int beyla_uprobe_readContinuedLineSliceReturns(struct pt_regs *ctx) {
     u64 len = (u64)GO_PARAM2(ctx);
     u8 *buf = (u8 *)GO_PARAM1(ctx);
 
-    if (len >= (W3C_KEY_LENGTH + W3C_VAL_LENGTH + 2)) {
-        u8 temp[W3C_KEY_LENGTH + W3C_VAL_LENGTH + 2];
-        bpf_probe_read(temp, sizeof(temp), buf);
-        bpf_dbg_printk("goroutine_addr %lx", goroutine_addr);
-        go_addr_key_t g_key = {};
-        go_addr_key_from_id(&g_key, goroutine_addr);
+    u8 temp[HTTP_HEADER_MAX_LEN];
+    if (len > sizeof(temp))
+        len = sizeof(temp);
+    bpf_probe_read(temp, len, buf);
 
-        connection_info_t *existing = bpf_map_lookup_elem(&ongoing_server_connections, &g_key);
-        if (existing) {
-            if (!bpf_memicmp((const char *)temp, "traceparent: ", W3C_KEY_LENGTH + 2)) {
-                server_http_func_invocation_t inv = {};
-                decode_go_traceparent(
-                    temp + W3C_KEY_LENGTH + 2, inv.tp.trace_id, inv.tp.parent_id, &inv.tp.flags);
-                bpf_dbg_printk("Found traceparent in header %s", temp);
-                bpf_map_update_elem(&ongoing_http_server_requests, &g_key, &inv, BPF_ANY);
-            }
+    bpf_dbg_printk("goroutine_addr %lx", goroutine_addr);
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+
+    int w3c_value_start = W3C_KEY_LENGTH + 2; // "traceparent: "
+    int w3c_header_length = w3c_value_start + W3C_VAL_LENGTH;
+    int content_type_value_start = CONTENT_TYPE_KEY_LEN + 2; // "content-type: "
+    int content_type_header_length = content_type_value_start + HTTP_CONTENT_TYPE_MAX_LEN;
+
+    connection_info_t *existing = bpf_map_lookup_elem(&ongoing_server_connections, &g_key);
+    if (!existing) {
+        return 0;
+    }
+    server_http_func_invocation_t *inv = bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
+
+    if (len >= w3c_header_length &&
+        !bpf_memicmp((const char *)temp, "traceparent: ", w3c_value_start)) {
+        u8 *traceparent_start = temp + w3c_value_start;
+        if (inv) {
+            update_traceparent(inv, traceparent_start);
+        } else {
+            server_http_func_invocation_t minimal_inv = {};
+            update_traceparent(&minimal_inv, traceparent_start);
+            bpf_map_update_elem(&ongoing_http_server_requests, &g_key, &minimal_inv, BPF_ANY);
+        }
+    } else if (len >= content_type_header_length &&
+               !bpf_memicmp((const char *)temp, "content-type: ", content_type_value_start)) {
+        u8 *content_type_start = temp + content_type_value_start;
+        if (inv) {
+            update_content_type(inv, content_type_start);
+        } else {
+            server_http_func_invocation_t minimal_inv = {};
+            update_content_type(&minimal_inv, content_type_start);
+            bpf_map_update_elem(&ongoing_http_server_requests, &g_key, &minimal_inv, BPF_ANY);
         }
     }
 
@@ -1163,6 +1210,72 @@ int beyla_uprobe_netFdRead(struct pt_regs *ctx) {
                               &sql_conn->conn); // ok to not check the result, we leave it as 0
     }
 
+    return 0;
+}
+
+SEC("uprobe/bodyRead")
+int beyla_uprobe_bodyRead(struct pt_regs *ctx) {
+    void *goroutine_addr = GOROUTINE_PTR(ctx);
+    bpf_dbg_printk("=== uprobe/proc body read goroutine === ");
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+
+    // Get the address of the slice struct (p)
+    u64 body_addr = (u64)GO_PARAM2(ctx);
+
+    server_http_func_invocation_t *invocation =
+        bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
+    if (!invocation) {
+        bpf_dbg_printk("can't find invocation info for server call");
+        return 0;
+    }
+    invocation->body_addr = body_addr;
+
+    return 0;
+}
+
+SEC("uprobe/bodyReadRet")
+int beyla_uprobe_bodyReadReturn(struct pt_regs *ctx) {
+    void *goroutine_addr = GOROUTINE_PTR(ctx);
+    bpf_dbg_printk("=== uprobe/proc body read returns goroutine === ");
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+
+    u64 n = (u64)GO_PARAM1(ctx);
+
+    server_http_func_invocation_t *invocation =
+        bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
+    if (!invocation) {
+        bpf_dbg_printk("can't find invocation info for server call");
+        return 0;
+    }
+    // content-type is set in invocation in ServeHTTP
+    bpf_dbg_printk("n is %d", n);
+    bpf_dbg_printk("content type is %s", invocation->content_type);
+
+    char body_buf[HTTP_BODY_MAX_LEN] = {};
+    if (n > 0 && invocation->body_addr) {
+        if (is_json_content_type((void *)invocation->content_type,
+                                 sizeof(invocation->content_type))) {
+            if (read_go_str_n(
+                    "http body", (void *)invocation->body_addr, n, body_buf, sizeof(body_buf))) {
+                bpf_dbg_printk("body is %s", body_buf);
+                if (is_jsonrpc2_body(body_buf, sizeof(body_buf))) {
+                    char method_buf[JSONRPC_METHOD_BUF_SIZE] = {};
+                    u32 method_len =
+                        extract_jsonrpc2_method(body_buf, sizeof(body_buf), method_buf);
+                    if (method_len > 0) {
+                        bpf_dbg_printk("JSON-RPC method: %s", method_buf);
+                        read_go_str_n("JSON-RPC method",
+                                      (void *)method_buf,
+                                      method_len,
+                                      invocation->method,
+                                      sizeof(invocation->method));
+                    }
+                }
+            }
+        }
+    }
     return 0;
 }
 

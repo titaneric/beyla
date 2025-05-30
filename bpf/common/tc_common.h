@@ -3,7 +3,7 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 
-enum { MAX_INLINE_LEN = 0x3ff };
+enum { MAX_INLINE_LEN = 0x3ff, MAX_NEEDLE_LEN = 16 };
 
 const char TP[] = "Traceparent: 00-00000000000000000000000000000000-0000000000000000-01\r\n";
 const u32 EXTEND_SIZE = sizeof(TP) - 1;
@@ -130,4 +130,29 @@ static __always_inline u32 sk_msg_local_port(struct sk_msg_md *ctx) {
         : [base] "r"(ctx), [offset] "i"(offsetof(struct sk_msg_md, local_port)), "m"(*ctx));
 
     return data;
+}
+
+// find the needle in the haystack, return the position of the first occurrence, return -1 if not found
+static __always_inline u32 bpf_memstr(const char *haystack,
+                                      int haystack_len,
+                                      const char *needle,
+                                      int needle_len) {
+    if (needle_len == 0 || haystack_len < needle_len)
+        return INVALID_POS;
+    for (int i = 0; i <= haystack_len - needle_len; i++) {
+        int found = 1;
+#pragma unroll
+        // max needle length
+        for (int j = 0; j < MAX_NEEDLE_LEN; j++) {
+            if (j >= needle_len)
+                break;
+            if (haystack[i + j] != needle[j]) {
+                found = 0;
+                break;
+            }
+        }
+        if (found)
+            return (u32)i;
+    }
+    return INVALID_POS;
 }
